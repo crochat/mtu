@@ -1,0 +1,244 @@
+#!/bin/bash
+
+target=$1
+
+minmtu=84
+maxmtu=65535
+maxhops=30
+finalmtu=$minmtu
+
+ipv4_valid(){
+    local result=0
+    local ip=$1
+
+    local part
+    if [[ $ip =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
+        for i in 1 2 3 4; do
+            part=$(echo "${ip}" | cut -d "." -f$i)
+            if [[ $part -gt 255 ]]; then
+                result=1
+                break
+            fi
+            if [[ $i -eq 4 && $part -eq 0 ]]; then
+                result=1
+                break
+            fi
+        done
+    else
+        result=1
+    fi
+
+    return $result
+}
+
+hex_ip_to_dec_ip(){
+    local hex_ip="$1"
+    for i in $(echo "$hex_ip" | sed -E 's/(..)(..)(..)(..)/\4 \3 \2 \1/'); do
+        printf "%d." $((16#$i))
+    done | sed 's/.$//'
+}
+
+get_netmask_bits(){
+    local c=0
+    local x=0$( printf '%o' ${1//./ } )
+    while [[ $x -gt 0 ]]; do
+        let c+=$((x%2)) 'x>>=1'
+    done
+    echo $c
+}
+
+get_default_dev(){
+    cat /proc/net/route | awk '{if($2 == '00000000') print $1}'
+}
+
+get_dev_net(){
+    local dev=$1
+
+    local dev_net_ip="$(cat /proc/net/route | awk -v dev=$dev '{if($1 == dev && !($2 == '00000000')) print $2}')"
+
+    hex_ip_to_dec_ip "$dev_net_ip"
+}
+
+get_dev_netmask(){
+    local dev=$1
+
+    local dev_netmask="$(cat /proc/net/route | awk -v dev=$dev '{if($1 == dev && !($2 == '00000000')) print $8}')"
+
+    hex_ip_to_dec_ip "$dev_netmask"
+}
+
+get_dev_netmask_bits(){
+    local netmask=$1
+
+    get_netmask_bits "$netmask"
+}
+
+get_default_gateway(){
+    local default_route_ip="$(cat /proc/net/route | awk '{if($2 == '00000000') print $3}')"
+
+    hex_ip_to_dec_ip "$default_route_ip"
+}
+
+get_dev_ip(){
+    local dev=$1
+
+    local dev_net=$(get_dev_net "$dev")
+    local dev_netmask=$(get_dev_netmask "$dev")
+    local dev_netmask_bits=$(get_dev_netmask_bits "$dev_netmask")
+    cat /proc/net/fib_trie | grep -A8 "$dev_net/$dev_netmask_bits" | awk '/32 host/ { print f } {f=$2}' | sort | uniq
+}
+
+get_greatest_mtu(){
+    local target=$1
+    if [[ $# -eq 2 && $2 != "" ]]; then
+        local maxmtu=$2
+    else
+        local maxmtu=$maxmtu
+    fi
+
+    simpleicmpcheck=$(ping -c1 -w1 $target | grep "1 received")
+    if [[ "$simpleicmpcheck" = "" ]]; then
+        return 1
+    fi
+
+    local default_dev=$(get_default_dev)
+    local default_dev_mtu=$(cat /sys/class/net/$default_dev/mtu)
+
+    local mtu=$maxmtu
+    if [[ -n $default_dev_mtu && $default_dev_mtu -lt $maxmtu ]]; then
+        mtu=$default_dev_mtu
+    fi
+
+    local lastpassedmtu=$minmtu
+    local lastmaxmtu=$mtu
+    local lastmtu=$mtu
+    local deltamtu=$mtu
+    local icmpcheck
+    local pass=0
+    while [[ $pass -ne 1 ]]; do
+        #echo "Testing MTU $mtu..."
+        icmpcheck=$(ping -s $(($mtu - 28)) -M do -c1 -w1 $target | grep "1 received")
+        if [[ "$icmpcheck" != "" ]]; then
+            #echo "passed"
+            if [[ $deltamtu -eq 0 ]]; then
+                finalmtu=$mtu
+                pass=1
+            elif [[ $deltamtu -eq 1 ]]; then        # We have to test with MTU+1
+                lastpassedmtu=$mtu
+                deltamtu=0
+                newmtu=$(expr $mtu + 1)
+                lastmtu=$mtu
+                finalmtu=$mtu
+                mtu=$newmtu
+            elif [[ $deltamtu -gt 1 ]]; then        # We have to increase MTU
+                lastpassedmtu=$mtu
+                deltamtu=$(expr $(expr $lastmaxmtu - $mtu) / 2)
+                newmtu=$(expr $mtu + $deltamtu)
+                lastmtu=$mtu
+                mtu=$newmtu
+            fi
+        else
+            #echo "failed"
+            if [[ $deltamtu -eq 0 ]]; then
+                finalmtu=$lastpassedmtu
+                pass=1
+            elif [[ $deltamtu -eq 1 ]]; then        # We have to test with MTU-1
+                if [[ $lastpassedmtu -eq $(expr $mtu - 1) ]]; then
+                    pass=1
+                else
+                    deltamtu=0
+                    newmtu=$(expr $mtu - 1)
+                    lastmaxmtu=$mtu
+                    lastmtu=$mtu
+                    mtu=$newmtu
+                fi
+            else                                    # We have to decrease MTU
+                deltamtu=$(expr $(expr $mtu - $lastpassedmtu) / 2)
+                newmtu=$(expr $mtu - $deltamtu)
+                lastmaxmtu=$mtu
+                lastmtu=$mtu
+                mtu=$newmtu
+            fi
+        fi
+    done
+    echo "$finalmtu"
+    return 0
+}
+
+get_mtu_bottleneck(){
+    local target=$1
+    if [[ $# -eq 2 && $2 != "" ]]; then
+        local maxmtu=$2
+    else
+        local maxmtu=$maxmtu
+    fi
+
+    local ip=""
+    local hops=0
+    local ttl=0
+    while [[ "$ip" != "$target" ]]; do
+        ip="n/a"
+        ttl=$(expr $ttl + 1)
+        icmpcheck=$(ping -c1 -w1 -t$ttl $target | awk '/^From.*exceeded$/ {print $2}')
+        if [[ "$icmpcheck" != "" ]]; then
+            ip=$icmpcheck
+        else
+            icmpcheck=$(ping -c1 -w1 -t$ttl $target | grep "from $target")
+            if [[ "$icmpcheck" != "" ]]; then
+                ip=$target
+            fi
+        fi
+
+        hops=$(expr $hops + 1)
+        if [[ $hops -gt $maxhops ]]; then
+            echo "Error: reached max hops ($maxhops)!"
+            exit 2
+        fi
+        echo -n "Hop $hops: $ip => MTU (decreasing from $maxmtu): "
+        if [[ "$ip" != "n/a" ]]; then
+            mtu=$(get_greatest_mtu "$ip" "$maxmtu")
+            if [[ "$mtu" != "" ]]; then
+                echo "$mtu"
+                if [[ $mtu -lt $maxmtu ]]; then
+                    maxmtu=$mtu
+                fi
+            else
+                echo "n/a (target unreachable)"
+            fi
+        else
+            echo "n/a (cannot get IP address)"
+        fi
+    done
+}
+
+if [[ "$(command -v ping)" = "" ]]; then
+    echo "ping not found!"
+    exit 1
+fi
+
+simpleicmpcheck=$(ping -c1 -w1 $target | grep "1 received")
+if [[ "$simpleicmpcheck" != "" ]]; then
+    ipv4_valid "$target"
+    if [[ $? -ne 0 ]]; then
+        target=$(ping -c1 -w1 $target | awk '/^PING/ {print $3}' | cut -c2- | rev | cut -c2- | rev)
+        ipv4_valid "$target"
+        if [[ $? -ne 0 ]]; then
+            echo "Error: Cannot get a valid IPv4 address from <$target>"
+            exit 1
+        fi
+    fi
+
+    default_dev=$(get_default_dev)
+    default_dev_mtu=$(cat /sys/class/net/$default_dev/mtu)
+    default_dev_net=$(get_dev_net "$default_dev")
+    default_dev_netmask=$(get_dev_netmask "$default_dev")
+    default_dev_netmask_bits=$(get_dev_netmask_bits "$default_dev_netmask")
+    default_dev_ip=$(get_dev_ip "$default_dev")
+    default_gw=$(get_default_gateway)
+
+    echo "Connected by <$default_dev> (MTU $default_dev_mtu) with IP <$default_dev_ip> (<$default_dev_net/$default_dev_netmask_bits>). Default gateway <$default_gw>"
+
+    get_mtu_bottleneck "$target"
+else
+    echo "Target $target is unreachable with ICMP"
+fi
