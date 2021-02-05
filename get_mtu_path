@@ -2,8 +2,8 @@
 
 target=$1
 
-minmtu=84
-maxmtu=65535
+minmtu=64
+maxmtu=9000
 maxhops=30
 finalmtu=$minmtu
 
@@ -48,13 +48,13 @@ get_netmask_bits(){
 }
 
 get_default_dev(){
-    cat /proc/net/route | awk '{if($2 == '00000000') print $1}'
+    cat /proc/net/route | awk '{if($2 == "00000000" && !($8 == "FFFFFFFF")) print $1}'
 }
 
 get_dev_net(){
     local dev=$1
 
-    local dev_net_ip="$(cat /proc/net/route | awk -v dev=$dev '{if($1 == dev && !($2 == '00000000')) print $2}')"
+    local dev_net_ip=$(cat /proc/net/route | awk -v dev=$dev '{if($1 == dev && !($2 == "00000000") && !($8 == "FFFFFFFF")) print $2}')
 
     hex_ip_to_dec_ip "$dev_net_ip"
 }
@@ -62,7 +62,7 @@ get_dev_net(){
 get_dev_netmask(){
     local dev=$1
 
-    local dev_netmask="$(cat /proc/net/route | awk -v dev=$dev '{if($1 == dev && !($2 == '00000000')) print $8}')"
+    local dev_netmask=$(cat /proc/net/route | awk -v dev=$dev '{if($1 == dev && !($2 == "00000000") && !($8 == "FFFFFFFF")) print $8}')
 
     hex_ip_to_dec_ip "$dev_netmask"
 }
@@ -74,7 +74,7 @@ get_dev_netmask_bits(){
 }
 
 get_default_gateway(){
-    local default_route_ip="$(cat /proc/net/route | awk '{if($2 == '00000000') print $3}')"
+    local default_route_ip=$(cat /proc/net/route | awk '{if($2 == "00000000" && !($8 == "FFFFFFFF")) print $3}')
 
     hex_ip_to_dec_ip "$default_route_ip"
 }
